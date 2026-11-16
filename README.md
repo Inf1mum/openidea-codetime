@@ -8,12 +8,25 @@ there is no network, no account, no telemetry.
 
 ## What it does
 
-- **Heartbeats.** Opening, saving or focusing a file is a heartbeat. A
-  60-second tick keeps counting while the same file stays focused, so quiet
-  work between saves is counted too. Each heartbeat credits the time since
-  the previous one — the stretch of work before a save or a switch counts.
-- **Idle detection.** After `idleMinutes` (default 5) without a heartbeat or
-  tick, time stops counting until the next one.
+- **Heartbeats.** Opening, saving or focusing a file is a heartbeat, and a
+  heartbeat credits the stretch of time since the previous one to the file
+  that stretch was spent on — the previously focused one, so the work before
+  a save, a switch to another file or losing editor focus counts. A stretch
+  longer than the idle threshold is treated as idle and counts nothing; the
+  heartbeat that ends it starts a new session.
+- **Idle detection.** After `idleMinutes` (default 5) without a heartbeat,
+  time stops counting until the next one.
+- **Across reclaims.** The host reclaims a plugin's instance after a few
+  minutes of idleness and recreates it on demand. CodeTime persists its
+  accounting session (which file, since when) and restores it on activation,
+  so a stretch that spans a reclaim still settles to the right file at the
+  next heartbeat. The manifest's `on-schedule` adds a wakeup for the same
+  purpose: the host delivers `Scheduled` only to an instance it recreated
+  after reclaiming the idle one — never to a live one — so it is not a
+  minute-by-minute counter. It settles a quiet stretch once while it is
+  still within the idle threshold, and expires the session otherwise; at the
+  default 5 minutes (the same as the host's reclaim timeout) a quiet stretch
+  is already past the threshold when the wakeup arrives and counts nothing.
 - **Status bar.** Today's total as `H:MM`; the tooltip breaks it down by
   project. Clicking it opens the dashboard.
 - **Dashboard.** A bottom tool window with a table of your time by project,
@@ -28,7 +41,7 @@ there is no network, no account, no telemetry.
 ## Install
 
 From the community marketplace (Settings › Plugins › Available › search
-"CodeTime"), or download `inf1mum.codetime-0.1.0.oiplugin` from
+"CodeTime"), or download `inf1mum.codetime-0.1.1.oiplugin` from
 [Releases](https://github.com/Inf1mum/openidea-codetime/releases) and use
 Settings › Plugins › *Install Plugin from Disk…*.
 
@@ -38,7 +51,7 @@ Settings › Plugins › CodeTime:
 
 | Setting | Meaning |
 | --- | --- |
-| `idleMinutes` | Minutes without a heartbeat or tick after which counting pauses (1–240, default 5). |
+| `idleMinutes` | Minutes without a heartbeat after which counting pauses (1–240, default 5). |
 | `exclude` | Globs of paths whose time is never counted, e.g. `**/node_modules/**`. `*` stays inside one path segment, `**` crosses segments, `?` is one character; a pattern without `/` matches the file name alone, a pattern with `/` is anchored to the path root. |
 
 ## Capabilities and why
@@ -57,10 +70,14 @@ no `process:*`, no `events.input`.
 ## Honest limits
 
 - **No keystrokes, no mouse.** The plugin API only exposes
-  `events.input`-less file events here, so coding time is *approximated* from
-  saves, focus switches and the 60-second tick. Continuous typing in one file
-  is counted through the tick; a stretch longer than the idle threshold with
-  no save and no focus change is not counted.
+  `events.input`-less file events here, so coding time is *approximated*
+  from saves, focus switches and losing editor focus; there is no
+  minute-by-minute sampling while one file stays focused, because the host
+  delivers scheduled wakeups only to an instance it recreated after
+  reclaiming the idle one (see *Across reclaims* above). A stretch with no
+  heartbeat at either end counts nothing at the default settings; with
+  `idleMinutes` above the host's reclaim timeout, a scheduled wakeup settles
+  its first idle-threshold-worth, once.
 - **UTC days.** The host exposes no timezone, so "today" and the day buckets
   are UTC calendar days.
 - **Rollover.** A stretch that crosses midnight is credited to the day it

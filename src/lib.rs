@@ -1,23 +1,30 @@
 //! CodeTime for OpenIDEA: a privacy-first coding-time tracker. Every file
-//! opened, saved or focused is a heartbeat; a 60-second tick keeps counting
-//! while the same file stays focused. A heartbeat credits the time since the
-//! previous one (so the stretch of work before a save or a focus switch
-//! counts), until the idle threshold passes. The totals land in per-day
-//! buckets in the plugin's storage, which the status bar reads for today's
-//! `H:MM` and the dashboard for today and the last 7 days: per project, per
-//! language and the files with the most time.
+//! opened, saved or focused is a heartbeat, and a heartbeat credits the time
+//! since the previous one to the file that stretch was spent on (so the work
+//! before a save, a switch or losing focus counts), until the idle threshold
+//! passes. The session — which file, since when — is persisted to the
+//! plugin's storage and restored on activation, so it survives the host
+//! reclaiming the plugin's idle instance; the host's scheduled wakeup
+//! (delivered only to an instance it just recreated) settles or expires it.
+//! The totals land in per-day buckets in the plugin's storage, which the
+//! status bar reads for today's `H:MM` and the dashboard for today and the
+//! last 7 days: per project, per language and the files with the most time.
 //!
 //! Nothing leaves the machine: no network, no keystrokes (the plugin asks for
 //! no `events.input`), only the file events the IDE already publishes.
 
 use openidea_plugin::host::{self, storage};
 use openidea_plugin::views::{Body, Button, Table, View, ViewEvent, Viewport, Views};
-use openidea_plugin::{Error, Event, Invocation, LogLevel, Plugin, StatusItem, register_plugin};
+use openidea_plugin::{Context, Error, Event, Invocation, LogLevel, Plugin, StatusItem, register_plugin};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// Storage keys of the day buckets: `d:YYYYMMDD` → a [`DayBucket`] as JSON.
 const DAY: &str = "d:";
+/// Storage key of the accounting session: a [`Session`] as JSON, persisted
+/// so the stretch of work since the last heartbeat survives the host
+/// reclaiming the plugin's idle instance.
+const SESSION: &str = "session";
 /// The last day (`YYYYMMDD`) pruning ran, so it runs once per day.
 const PRUNED: &str = "pruned-day";
 /// Day buckets older than this many days are deleted (only the 7-day
@@ -316,19 +323,32 @@ pub enum Period {
     Days7,
 }
 
+/// The accounting session as persisted under [`SESSION`]: the file the
+/// current stretch is credited to, when its last accounting point was, and
+/// whether a scheduled wakeup already settled it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct Session {
+    path: String,
+    last: u64,
+    ticked: bool,
+}
+
 pub struct CodeTime {
     /// Seconds since the epoch; the tests swap a fixed clock in.
     clock: Box<dyn Fn() -> u64>,
-    /// The file the current session credits to, from the last heartbeat.
+    /// The file the current stretch is credited to, from the last heartbeat.
     focused: Option<String>,
-    /// When the last heartbeat or tick happened.
+    /// When the stretch's last accounting point was (a heartbeat or a
+    /// scheduled wakeup).
     last_secs: u64,
+    /// A scheduled wakeup already settled this stretch (no activity since).
+    ticked: bool,
     period: Period,
 }
 
 impl Default for CodeTime {
     fn default() -> Self {
-        Self { clock: Box::new(now_secs), focused: None, last_secs: 0, period: Period::default() }
+        Self { clock: Box::new(now_secs), focused: None, last_secs: 0, ticked: false, period: Period::default() }
     }
 }
 
@@ -338,34 +358,100 @@ impl CodeTime {
         Self { clock: now, ..CodeTime::default() }
     }
 
-    /// A heartbeat for `path` at `now`: the same file within the idle
-    /// threshold credits the elapsed time, anything else just starts a new
-    /// session (a long stretch counts from the heartbeat that ends it).
+    /// Restores the persisted session; runs on activation, i.e. when the
+    /// host creates a fresh instance (also after reclaiming the idle one).
+    fn restore(&mut self) {
+        if let Ok(Some(json)) = storage::get(SESSION)
+            && let Ok(s) = serde_json::from_str::<Session>(&json)
+        {
+            self.focused = Some(s.path);
+            self.last_secs = s.last;
+            self.ticked = s.ticked;
+        }
+    }
+
+    /// Persists the session, or deletes the key when there is none. Storage
+    /// trouble is swallowed: nothing is counted with or without it.
+    fn persist(&self) {
+        match &self.focused {
+            Some(path) => {
+                let json = serde_json::to_string(&Session {
+                    path: path.clone(),
+                    last: self.last_secs,
+                    ticked: self.ticked,
+                })
+                .expect("a session serializes");
+                let _ = storage::set(SESSION, &json);
+            }
+            None => {
+                let _ = storage::delete(SESSION);
+            }
+        }
+    }
+
+    /// A heartbeat for `path` at `now`: the stretch since the previous
+    /// accounting point settles to the file it was spent on (the previously
+    /// focused one — a switch does not discard it) when it is within the
+    /// idle threshold; anything else just starts a new session (a long
+    /// stretch counts from the heartbeat that ends it).
     fn heartbeat(&mut self, path: &str, now: u64, globs: &[String], ctx: &Invocation) {
         if now < self.last_secs {
             return; // the clock went backwards: ignore the heartbeat
         }
+        self.settle_stretch(now, globs, ctx);
+        self.focused = Some(path.to_owned());
+        self.last_secs = now;
+        self.ticked = false;
+        self.persist();
+    }
+
+    /// The editor lost its file focus: the stretch settles to the file it
+    /// was spent on and the session ends.
+    fn blur(&mut self, now: u64, globs: &[String], ctx: &Invocation) {
+        if now < self.last_secs {
+            return;
+        }
+        self.settle_stretch(now, globs, ctx);
+        self.focused = None;
+        self.last_secs = now;
+        self.ticked = false;
+        self.persist();
+    }
+
+    /// Credits the stretch since the last accounting point to the previously
+    /// focused file when there is one and the stretch is within the idle
+    /// threshold (an excluded path credits nothing).
+    fn settle_stretch(&mut self, now: u64, globs: &[String], ctx: &Invocation) {
         let elapsed = now - self.last_secs;
-        if self.focused.as_deref() == Some(path) && elapsed <= idle_secs() {
-            self.credit(path, elapsed, now, globs, ctx);
-            self.last_secs = now;
-        } else {
-            self.focused = Some(path.to_owned());
-            self.last_secs = now;
+        if elapsed <= idle_secs()
+            && let Some(prev) = self.focused.clone()
+        {
+            self.credit(&prev, elapsed, now, globs, ctx);
         }
     }
 
-    /// The `on-schedule` tick: keeps crediting the focused file while it
-    /// stays focused within the idle threshold.
+    /// The `on-schedule` wakeup. The host delivers `Scheduled` only to an
+    /// instance it recreated after reclaiming the idle one — never to a live
+    /// instance — so this is not a minute counter: it settles the persisted
+    /// stretch once (the `ticked` flag keeps it to once) while it is still
+    /// within the idle threshold, and expires the session otherwise.
     fn tick(&mut self, now: u64, globs: &[String], ctx: &Invocation) {
         if now < self.last_secs {
             return;
         }
         let elapsed = now - self.last_secs;
-        if elapsed > 0 && elapsed <= idle_secs() && let Some(path) = self.focused.clone() {
+        let settles = elapsed > 0 && elapsed <= idle_secs() && !self.ticked && self.focused.is_some();
+        if settles {
+            let path = self.focused.clone().expect("focused, checked above");
             self.credit(&path, elapsed, now, globs, ctx);
             self.last_secs = now;
+            self.ticked = true;
+        } else {
+            self.focused = None;
+            self.last_secs = now;
+            self.ticked = false;
         }
+        self.persist();
     }
 
     /// Credits `secs` of `path` into the day `now` ends in and saves the
@@ -386,6 +472,11 @@ impl CodeTime {
 }
 
 impl Plugin for CodeTime {
+    fn activate(&mut self, _ctx: &Context) -> Result<(), Error> {
+        self.restore();
+        Ok(())
+    }
+
     fn run_command(&mut self, id: &str, _ctx: &Invocation, _arg: Option<&str>) -> Result<Option<String>, Error> {
         let now = (self.clock)();
         match id {
@@ -406,6 +497,7 @@ impl Plugin for CodeTime {
                     storage::delete(&key)?;
                 }
                 let _ = storage::delete(PRUNED);
+                let _ = storage::delete(SESSION);
                 host::remove_status_item(ITEM);
                 Ok(Some("CodeTime statistics were reset.".into()))
             }
@@ -420,6 +512,7 @@ impl Plugin for CodeTime {
             match e {
                 Event::FileOpened(path) | Event::FileSaved(path) => self.heartbeat(path, now, &globs, ctx),
                 Event::EditorFocused(Some(path)) => self.heartbeat(path, now, &globs, ctx),
+                Event::EditorFocused(None) => self.blur(now, &globs, ctx),
                 Event::Scheduled => self.tick(now, &globs, ctx),
                 _ => {}
             }
@@ -508,8 +601,11 @@ impl Views for CodeTime {
             rows,
             editable: false,
         }))
-        .button(Button::new("today", "Today").enabled(self.period == Period::Today))
-        .button(Button::new("days7", "Last 7 Days").enabled(self.period == Period::Days7))
+        // Both periods stay selectable: `enabled` renders as the button's
+        // disabled state, so only the already-selected period being enabled
+        // would lock the toolbar on the default one.
+        .button(Button::new("today", "Today"))
+        .button(Button::new("days7", "Last 7 Days"))
         .button(Button::new("refresh", "Refresh").icon("refresh"))
         .status(&format!("Total {label}: {}", format_hm(bucket.total))))
     }
@@ -549,6 +645,21 @@ mod tests {
 
     fn bucket_of(day: &str) -> DayBucket {
         load_day(day).unwrap_or_default()
+    }
+
+    /// The persisted session's JSON, as [`CodeTime::persist`] writes it.
+    fn session_json(path: &str, last: u64, ticked: bool) -> String {
+        format!(r#"{{"path":"{path}","last":{last},"ticked":{ticked}}}"#)
+    }
+
+    /// A fresh instance the way the host creates one after reclaiming the
+    /// idle plugin: a new `CodeTime` that runs `activate` (restoring the
+    /// persisted session) on the same storage and clock.
+    fn reclaimed(host: &MockHost, t: &Rc<Cell<u64>>) -> CodeTime {
+        let now = { let t = t.clone(); Box::new(move || t.get()) as Box<dyn Fn() -> u64> };
+        let mut fresh = CodeTime::with_clock(now);
+        fresh.activate(&host.context("inf1mum.codetime")).expect("activate");
+        fresh
     }
 
     #[test]
@@ -647,11 +758,12 @@ mod tests {
         t.set(DAY0 + 30);
         p.handle_events(&[Event::FileSaved(f.clone())], &ctx);
         assert_eq!(bucket_of(&day_key(DAY0)).total, 30);
-        // The tick keeps counting the same file.
+        // A wakeup settles the quiet stretch since the save once.
         t.set(DAY0 + 90);
         p.handle_events(&[Event::Scheduled], &ctx);
         assert_eq!(bucket_of(&day_key(DAY0)).total, 90);
-        // Past the idle threshold (default 5 min): the quiet stretch is lost.
+        // Another wakeup without activity in between does not count on; past
+        // the idle threshold (default 5 min) the quiet stretch is over.
         t.set(DAY0 + 90 + 600);
         p.handle_events(&[Event::Scheduled], &ctx);
         assert_eq!(bucket_of(&day_key(DAY0)).total, 90);
@@ -666,22 +778,121 @@ mod tests {
     }
 
     #[test]
-    fn switching_files_credits_the_new_one_from_its_focus() {
+    fn switching_files_credits_the_stretch_before_the_switch() {
         let host = MockHost::install();
         let (mut p, t) = plugin(DAY0);
         let ctx = host.invocation();
         p.handle_events(&[Event::EditorFocused(Some("/project/src/a.rs".into()))], &ctx);
-        t.set(DAY0 + 60);
+        // Thirty seconds of work in a.rs, then a switch: the stretch settles
+        // to a.rs, the file it was spent on, and b.rs counts from its focus.
+        t.set(DAY0 + 30);
         p.handle_events(&[Event::EditorFocused(Some("/project/src/b.rs".into()))], &ctx);
-        assert_eq!(bucket_of(&day_key(DAY0)).total, 0, "the stretch before the switch is not counted");
-        t.set(DAY0 + 120);
-        p.handle_events(&[Event::Scheduled], &ctx);
-        assert_eq!(bucket_of(&day_key(DAY0)).total, 60);
         let b = bucket_of(&day_key(DAY0));
-        assert_eq!(b.projects, BTreeMap::from([("project".into(), 60)]));
-        assert_eq!(b.langs, BTreeMap::from([("Rust".into(), 60)]));
-        assert!(b.files.contains_key("/project/src/b.rs"));
-        assert!(b.files.get("/project/src/a.rs").is_none());
+        assert_eq!(b.total, 30, "the stretch before the switch counts");
+        assert_eq!(b.files.get("/project/src/a.rs"), Some(&30));
+        assert!(b.files.get("/project/src/b.rs").is_none());
+        assert_eq!(host.storage()["session"], session_json("/project/src/b.rs", DAY0 + 30, false));
+        // A wakeup later settles b.rs's own stretch.
+        t.set(DAY0 + 90);
+        p.handle_events(&[Event::Scheduled], &ctx);
+        let b = bucket_of(&day_key(DAY0));
+        assert_eq!(b.total, 90);
+        assert_eq!(b.files.get("/project/src/b.rs"), Some(&60));
+        assert_eq!(b.projects, BTreeMap::from([("project".into(), 90)]));
+        assert_eq!(b.langs, BTreeMap::from([("Rust".into(), 90)]));
+    }
+
+    #[test]
+    fn losing_editor_focus_settles_and_ends_the_session() {
+        let host = MockHost::install();
+        let (mut p, t) = plugin(DAY0);
+        let ctx = host.invocation();
+        p.handle_events(&[Event::EditorFocused(Some("/project/src/a.rs".into()))], &ctx);
+        t.set(DAY0 + 120);
+        p.handle_events(&[Event::EditorFocused(None)], &ctx);
+        assert_eq!(bucket_of(&day_key(DAY0)).total, 120, "the stretch settles to the file it was spent on");
+        assert!(!host.storage().contains_key(SESSION), "the session ended with the focus");
+        // Without a focused file, a wakeup settles nothing.
+        t.set(DAY0 + 240);
+        p.handle_events(&[Event::Scheduled], &ctx);
+        assert_eq!(bucket_of(&day_key(DAY0)).total, 120);
+        // The editor-less stretch does not land on the next focused file.
+        t.set(DAY0 + 300);
+        p.handle_events(&[Event::EditorFocused(Some("/project/src/b.rs".into()))], &ctx);
+        assert_eq!(bucket_of(&day_key(DAY0)).total, 120);
+    }
+
+    #[test]
+    fn a_session_survives_reclaim_and_the_wakeup_settles_it_once() {
+        let host = MockHost::install();
+        let (mut p, t) = plugin(DAY0);
+        let ctx = host.invocation();
+        p.handle_events(&[Event::FileOpened("/project/src/a.rs".into())], &ctx);
+        assert_eq!(
+            host.storage()[SESSION],
+            session_json("/project/src/a.rs", DAY0, false),
+            "the session is persisted for the next instance"
+        );
+        // The host reclaims the idle instance; the due schedule reaches a
+        // fresh one, which restores the session and settles the stretch.
+        t.set(DAY0 + 200);
+        let mut p = reclaimed(&host, &t);
+        p.handle_events(&[Event::Scheduled], &ctx);
+        assert_eq!(bucket_of(&day_key(DAY0)).total, 200, "the wakeup settles the persisted stretch");
+        assert_eq!(bucket_of(&day_key(DAY0)).files.get("/project/src/a.rs"), Some(&200));
+        assert_eq!(host.storage()[SESSION], session_json("/project/src/a.rs", DAY0 + 200, true));
+        // A second wakeup without activity in between does not count on.
+        t.set(DAY0 + 400);
+        p.handle_events(&[Event::Scheduled], &ctx);
+        assert_eq!(bucket_of(&day_key(DAY0)).total, 200, "a quiet stretch is settled once");
+        assert!(!host.storage().contains_key(SESSION), "the expired session is gone");
+        // A heartbeat afterwards starts a fresh session without credit.
+        t.set(DAY0 + 420);
+        p.handle_events(&[Event::FileSaved("/project/src/a.rs".into())], &ctx);
+        assert_eq!(bucket_of(&day_key(DAY0)).total, 200);
+        assert_eq!(host.storage()[SESSION], session_json("/project/src/a.rs", DAY0 + 420, false));
+    }
+
+    #[test]
+    fn a_stretch_past_the_idle_threshold_is_expired_by_the_wakeup() {
+        let host = MockHost::install();
+        let (mut p, t) = plugin(DAY0);
+        let ctx = host.invocation();
+        p.handle_events(&[Event::EditorFocused(Some("/project/src/a.rs".into()))], &ctx);
+        // The wakeup arrives only after the host's idle reclaim, so the
+        // quiet stretch is already past the idle threshold: it counts
+        // nothing and the session ends.
+        t.set(DAY0 + 400);
+        let mut fresh = reclaimed(&host, &t);
+        fresh.handle_events(&[Event::Scheduled], &ctx);
+        assert_eq!(bucket_of(&day_key(DAY0)).total, 0);
+        assert!(!host.storage().contains_key(SESSION));
+        t.set(DAY0 + 430);
+        fresh.handle_events(&[Event::EditorFocused(Some("/project/src/b.rs".into()))], &ctx);
+        assert_eq!(bucket_of(&day_key(DAY0)).total, 0, "the fresh session starts without credit");
+        assert_eq!(host.storage()[SESSION], session_json("/project/src/b.rs", DAY0 + 430, false));
+    }
+
+    #[test]
+    fn a_focus_switch_after_reclaim_settles_the_saved_stretch() {
+        let host = MockHost::install();
+        let (mut p, t) = plugin(DAY0);
+        let ctx = host.invocation();
+        p.handle_events(&[Event::FileOpened("/project/src/a.rs".into())], &ctx);
+        // The switch arrives at a fresh instance; the persisted stretch
+        // settles to the file it was spent on.
+        t.set(DAY0 + 150);
+        let mut fresh = reclaimed(&host, &t);
+        fresh.handle_events(&[Event::EditorFocused(Some("/project/src/b.rs".into()))], &ctx);
+        let b = bucket_of(&day_key(DAY0));
+        assert_eq!(b.total, 150, "the stretch saved before the reclaim settles at the switch");
+        assert_eq!(b.files, BTreeMap::from([("/project/src/a.rs".into(), 150)]));
+        // b.rs counts from its own focus, settled by the next wakeup.
+        t.set(DAY0 + 300);
+        fresh.handle_events(&[Event::Scheduled], &ctx);
+        let b = bucket_of(&day_key(DAY0));
+        assert_eq!(b.total, 300);
+        assert_eq!(b.files.get("/project/src/b.rs"), Some(&150));
     }
 
     #[test]
@@ -758,10 +969,13 @@ mod tests {
         assert!(host.storage().contains_key(&format!("{DAY}{}", day_key(now - 10 * 86_400))));
     }
 
-    fn thirty_minutes_of_work(p: &mut CodeTime, host: &MockHost, t: &Rc<Cell<u64>>, from: u64) {
+    /// Thirty minutes of work as the editor reports it: a save of `path`
+    /// every minute (autosave), each heartbeat settling the minute since
+    /// the previous one.
+    fn thirty_minutes_of_saves(p: &mut CodeTime, host: &MockHost, t: &Rc<Cell<u64>>, path: &str, from: u64) {
         for m in 1..=30u64 {
             t.set(from + m * 60);
-            p.handle_events(&[Event::Scheduled], &host.invocation());
+            p.handle_events(&[Event::FileSaved(path.into())], &host.invocation());
         }
     }
 
@@ -771,12 +985,12 @@ mod tests {
         let (mut p, t) = plugin(DAY0);
         let ctx = host.invocation();
         p.handle_events(&[Event::EditorFocused(Some("/project/src/main.rs".into()))], &ctx);
-        thirty_minutes_of_work(&mut p, &host, &t, DAY0);
+        thirty_minutes_of_saves(&mut p, &host, &t, "/project/src/main.rs", DAY0);
         p.handle_events(&[Event::EditorFocused(Some("/project/README.md".into()))], &host.invocation());
-        thirty_minutes_of_work(&mut p, &host, &t, DAY0 + 1_800);
+        thirty_minutes_of_saves(&mut p, &host, &t, "/project/README.md", DAY0 + 1_800);
         p.handle_events(&[Event::EditorFocused(Some("/project/src/lib.rs".into()))], &host.invocation());
         t.set(DAY0 + 3_660);
-        p.handle_events(&[Event::Scheduled], &ctx);
+        p.handle_events(&[Event::FileSaved("/project/src/lib.rs".into())], &ctx);
         assert_eq!(bucket_of(&day_key(DAY0)).total, 3_660);
 
         let view = p.render("dashboard", None, &ctx).unwrap();
@@ -792,6 +1006,41 @@ mod tests {
         assert_eq!(host.refreshed_views(), ["dashboard"]);
         let view = p.render("dashboard", None, &ctx).unwrap();
         assert_eq!(view.status.as_deref(), Some("Total last 7 days: 1:01"));
+        // …and back to today.
+        p.handle("dashboard", ViewEvent::Button("today".into()), &ctx).unwrap();
+        let view = p.render("dashboard", None, &ctx).unwrap();
+        assert_eq!(view.status.as_deref(), Some("Total today: 1:01"));
+        assert_eq!(host.refreshed_views(), ["dashboard", "dashboard"]);
+    }
+
+    #[test]
+    fn the_toolbar_keeps_both_periods_selectable() {
+        let host = MockHost::install();
+        let (mut p, _t) = plugin(DAY0);
+        let ctx = host.invocation();
+        let mut bucket = DayBucket::default();
+        bucket.add("project", "Rust", "/project/src/main.rs", 60);
+        storage::set(&format!("{DAY}{}", day_key(DAY0)), &serde_json::to_string(&bucket).unwrap()).unwrap();
+        // The default (today) toolbar: the host renders `enabled: false` as a
+        // disabled button, so the other period must not carry that flag.
+        let enabled = |view: &View| -> Vec<(String, bool)> {
+            view.toolbar
+                .iter()
+                .filter(|b| b.id == "today" || b.id == "days7")
+                .map(|b| (b.id.clone(), b.enabled))
+                .collect()
+        };
+        let view = p.render("dashboard", None, &ctx).unwrap();
+        assert_eq!(enabled(&view), [("today".into(), true), ("days7".into(), true)]);
+        assert_eq!(view.status.as_deref(), Some("Total today: 0:01"));
+        // Both transitions work and keep both buttons selectable.
+        p.handle("dashboard", ViewEvent::Button("days7".into()), &ctx).unwrap();
+        let view = p.render("dashboard", None, &ctx).unwrap();
+        assert_eq!(view.status.as_deref(), Some("Total last 7 days: 0:01"));
+        assert_eq!(enabled(&view), [("today".into(), true), ("days7".into(), true)], "today stays selectable");
+        p.handle("dashboard", ViewEvent::Button("today".into()), &ctx).unwrap();
+        let view = p.render("dashboard", None, &ctx).unwrap();
+        assert_eq!(view.status.as_deref(), Some("Total today: 0:01"));
     }
 
     #[test]
@@ -833,8 +1082,9 @@ mod tests {
         p.handle_events(&[Event::EditorFocused(Some("/project/src/a.rs".into()))], &ctx);
         for m in 1..=60u64 {
             t.set(DAY0 + m * 60);
-            p.handle_events(&[Event::Scheduled], &ctx);
+            p.handle_events(&[Event::FileSaved("/project/src/a.rs".into())], &ctx);
         }
+        assert!(host.storage().contains_key(SESSION), "the live session is persisted");
         let out = p.run_command("export-summary", &ctx, None).unwrap().unwrap();
         let clipboard = host.clipboard().expect("the summary was copied");
         assert!(clipboard.contains("CodeTime — today (20251116): 1:00"));
@@ -843,7 +1093,7 @@ mod tests {
         assert!(clipboard.contains("Last 7 days: 1:00"));
         assert!(out.contains("copied"));
         p.run_command("reset", &ctx, None).unwrap();
-        assert!(host.storage().is_empty(), "the day buckets and the prune marker are gone");
+        assert!(host.storage().is_empty(), "the day buckets, the prune marker and the session are gone");
         assert!(host.status_items().is_empty(), "the status bar item is removed");
         assert_eq!(
             p.run_command("export-summary", &ctx, None).unwrap().unwrap(),
