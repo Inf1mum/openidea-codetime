@@ -1,0 +1,54 @@
+id = "inf1mum.codetime"
+name = "CodeTime"
+version = "0.1.0"
+description = "Privacy-first coding-time tracker: counts the time you spend in the editor per project, language and file, shows today's total in the status bar and a dashboard for today and the last 7 days. Everything stays on your machine."
+authors = ["Inf1mum"]
+license = "Apache-2.0"
+change-notes = "0.1.0 — first release: heartbeats from file open/save/focus plus a 60 s tick, idle detection, status bar timer, today/7-day dashboard (projects, languages, top files), export summary to the clipboard, reset."
+categories = ["tools"]
+engines.openidea = "^1.4"
+wasm = "dist/plugin.wasm"
+# Heartbeats arrive with the file events; the minute tick keeps counting while
+# the same file stays focused. The dashboard view and every command activate
+# the plugin too.
+activation = [
+    "on-event:file-opened",
+    "on-event:file-saved",
+    "on-event:editor-focused",
+    "on-schedule:60",
+    "on-view:dashboard",
+    "on-command:*",
+]
+
+[capabilities]
+# events: the file-opened/file-saved/editor-focused heartbeats. project.read:
+# which open project a file belongs to (the dashboard groups by project).
+# storage: the per-day buckets the totals come from.
+required = ["events", "project.read", "storage"]
+# clipboard: only "CodeTime: Export Summary to Clipboard" writes to it.
+optional = ["clipboard"]
+
+[[contributes.commands]]
+id = "show-dashboard"
+title = "CodeTime: Show Dashboard"
+category = "CodeTime"
+
+[[contributes.commands]]
+id = "export-summary"
+title = "CodeTime: Export Summary to Clipboard"
+category = "CodeTime"
+
+[[contributes.commands]]
+id = "reset"
+title = "CodeTime: Reset Statistics"
+category = "CodeTime"
+
+[[contributes.views]]
+id = "dashboard"
+title = "CodeTime"
+icon = "clock"
+location = "bottom"
+
+[contributes.settings]
+title = "CodeTime"
+schema = "settings.schema.json"
