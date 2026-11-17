@@ -36,12 +36,14 @@ there is no network, no account, no telemetry.
   - *CodeTime: Show Dashboard* — opens the dashboard;
   - *CodeTime: Export Summary to Clipboard* — a text summary of today and
     the week (by project and language);
-  - *CodeTime: Reset Statistics* — deletes every recorded day.
+  - *CodeTime: Reset Statistics* — deletes every recorded day and ends the
+    current accounting session, so counting starts from scratch (the stretch
+    of work since the last heartbeat is not carried over).
 
 ## Install
 
 From the community marketplace (Settings › Plugins › Available › search
-"CodeTime"), or download `inf1mum.codetime-0.1.1.oiplugin` from
+"CodeTime"), or download `inf1mum.codetime-0.1.2.oiplugin` from
 [Releases](https://github.com/Inf1mum/openidea-codetime/releases) and use
 Settings › Plugins › *Install Plugin from Disk…*.
 

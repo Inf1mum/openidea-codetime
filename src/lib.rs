@@ -497,7 +497,15 @@ impl Plugin for CodeTime {
                     storage::delete(&key)?;
                 }
                 let _ = storage::delete(PRUNED);
-                let _ = storage::delete(SESSION);
+                // Reset ends the live accounting session together with the
+                // stored one: a heartbeat or a reclaim afterwards starts from
+                // nothing instead of re-settling the stretch from before the
+                // reset. `persist` deletes the stored session when there is
+                // no live one, so the two cannot drift apart.
+                self.focused = None;
+                self.last_secs = 0;
+                self.ticked = false;
+                self.persist();
                 host::remove_status_item(ITEM);
                 Ok(Some("CodeTime statistics were reset.".into()))
             }
@@ -1100,6 +1108,65 @@ mod tests {
             "CodeTime summary copied to the clipboard."
         );
         assert!(host.clipboard().unwrap().contains("nothing recorded"));
+    }
+
+    /// The maintainer's repro: a heartbeat after the reset must not re-settle
+    /// the stretch from before it — reset ends the live session, so only the
+    /// work after the reset is eligible.
+    #[test]
+    fn reset_ends_the_live_session_and_the_next_heartbeat_starts_fresh() {
+        let host = MockHost::install();
+        let (mut p, t) = plugin(DAY0);
+        let ctx = host.invocation();
+        let f = "/project/src/a.rs".to_owned();
+        p.handle_events(&[Event::EditorFocused(Some(f.clone()))], &ctx);
+        t.set(DAY0 + 60);
+        p.handle_events(&[Event::FileSaved(f.clone())], &ctx);
+        assert_eq!(bucket_of(&day_key(DAY0)).total, 60);
+        assert_eq!(host.storage()[SESSION], session_json(&f, DAY0 + 60, false));
+        // Reset at +90 clears the buckets and the live session alike.
+        t.set(DAY0 + 90);
+        p.run_command("reset", &ctx, None).unwrap();
+        assert!(host.storage().is_empty(), "the stored session is gone with the totals");
+        // The save at +120 keeps the focus: with the session ended it starts
+        // a fresh one and re-credits nothing — not the 30 seconds from
+        // before the reset.
+        t.set(DAY0 + 120);
+        p.handle_events(&[Event::FileSaved(f.clone())], &ctx);
+        assert_eq!(bucket_of(&day_key(DAY0)).total, 0, "no stale stretch re-settles after the reset");
+        assert_eq!(host.storage()[SESSION], session_json(&f, DAY0 + 120, false));
+        // Only the work after the reset counts, credited by the next heartbeat.
+        t.set(DAY0 + 180);
+        p.handle_events(&[Event::FileSaved(f.clone())], &ctx);
+        assert_eq!(bucket_of(&day_key(DAY0)).total, 60, "the stretch after the reset counts from its own heartbeat");
+        assert_eq!(bucket_of(&day_key(DAY0)).files.get(f.as_str()), Some(&60));
+    }
+
+    /// Reset followed by a reclaim: the fresh instance restores no session,
+    /// so the scheduled wakeup expires nothing and no stale time re-settles.
+    #[test]
+    fn reset_followed_by_a_reclaim_starts_from_nothing() {
+        let host = MockHost::install();
+        let (mut p, t) = plugin(DAY0);
+        let ctx = host.invocation();
+        p.handle_events(&[Event::EditorFocused(Some("/project/src/a.rs".into()))], &ctx);
+        t.set(DAY0 + 60);
+        p.handle_events(&[Event::FileSaved("/project/src/a.rs".into())], &ctx);
+        t.set(DAY0 + 90);
+        p.run_command("reset", &ctx, None).unwrap();
+        assert!(!host.storage().contains_key(SESSION), "reset ends the persisted session");
+        // The host reclaims the idle instance; the fresh one restores
+        // nothing, and the due wakeup credits nothing from before the reset.
+        t.set(DAY0 + 200);
+        let mut fresh = reclaimed(&host, &t);
+        fresh.handle_events(&[Event::Scheduled], &ctx);
+        assert_eq!(bucket_of(&day_key(DAY0)).total, 0, "the reclaim after the reset starts from nothing");
+        assert!(!host.storage().contains_key(SESSION), "the wakeup expires the empty session");
+        // A heartbeat afterwards starts a fresh session without credit.
+        t.set(DAY0 + 230);
+        fresh.handle_events(&[Event::EditorFocused(Some("/project/src/a.rs".into()))], &ctx);
+        assert_eq!(bucket_of(&day_key(DAY0)).total, 0);
+        assert_eq!(host.storage()[SESSION], session_json("/project/src/a.rs", DAY0 + 230, false));
     }
 
     #[test]

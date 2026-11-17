@@ -1,10 +1,10 @@
 id = "inf1mum.codetime"
 name = "CodeTime"
-version = "0.1.1"
+version = "0.1.2"
 description = "Privacy-first coding-time tracker: counts the time you spend in the editor per project, language and file, shows today's total in the status bar and a dashboard for today and the last 7 days. Everything stays on your machine."
 authors = ["Inf1mum"]
 license = "Apache-2.0"
-change-notes = "0.1.1 — review fixes: both dashboard periods are selectable; a focus switch (or losing editor focus) settles the stretch of work before it instead of dropping it; the accounting session is persisted and restored on activation, so it survives the host's idle reclaim, and the scheduled wakeup settles or expires it the way the host actually delivers it. 0.1.0 — first release: heartbeats from file open/save/focus, idle detection, status bar timer, today/7-day dashboard (projects, languages, top files), export summary to the clipboard, reset."
+change-notes = "0.1.2 — review fix: Reset Statistics also ends the live accounting session (the focused file and its accounting point), so a heartbeat or a reclaim afterwards starts from nothing instead of re-settling the stretch from before the reset. 0.1.1 — review fixes: both dashboard periods are selectable; a focus switch (or losing editor focus) settles the stretch of work before it instead of dropping it; the accounting session is persisted and restored on activation, so it survives the host's idle reclaim, and the scheduled wakeup settles or expires it the way the host actually delivers it. 0.1.0 — first release: heartbeats from file open/save/focus, idle detection, status bar timer, today/7-day dashboard (projects, languages, top files), export summary to the clipboard, reset."
 categories = ["tools"]
 engines.openidea = "^1.4"
 wasm = "dist/plugin.wasm"
